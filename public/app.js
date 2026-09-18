@@ -10,6 +10,7 @@
     busy: false,
     result: null,
     resultView: 'structured',
+    repeat: null,
   };
 
   const dom = {
@@ -34,6 +35,15 @@
     refreshCases: document.getElementById('refresh-cases'),
     caseDetail: document.getElementById('case-detail'),
     closeDetail: document.getElementById('close-detail'),
+    repeatTotal: document.getElementById('repeat-total'),
+    repeatConcurrency: document.getElementById('repeat-concurrency'),
+    repeatStart: document.getElementById('repeat-start'),
+    repeatPhaseTag: document.getElementById('repeat-phase-tag'),
+    repeatRows: document.getElementById('repeat-rows'),
+    statQueued: document.getElementById('stat-queued'),
+    statFlying: document.getElementById('stat-flying'),
+    statSent: document.getElementById('stat-sent'),
+    statDone: document.getElementById('stat-done'),
   };
 
   const emptyDetailHint = '在用例列表点「详情」，这里显示该用例保存下来的目标地址、请求头与请求内容。';
@@ -107,14 +117,14 @@
       node.hidden = true;
       node.textContent = '';
     });
-    [dom.name, dom.url, dom.body, dom.headerRows].forEach((node) => node.classList.remove('invalid'));
+    [dom.name, dom.url, dom.body, dom.headerRows, dom.repeatTotal, dom.repeatConcurrency].forEach((node) => node.classList.remove('invalid'));
   }
 
   // 服务端给出的位置可能是 headers.2.key 这种形式，标记时按区块归位
   function normalizeField(field) {
     if (typeof field !== 'string' || !field) return '';
     const key = field.split('.')[0];
-    return ['name', 'method', 'url', 'headers', 'body'].includes(key) ? key : '';
+    return ['name', 'method', 'url', 'headers', 'body', 'repeatTotal', 'repeatConcurrency'].includes(key) ? key : '';
   }
 
   function showFieldError(field, message) {
@@ -131,6 +141,8 @@
       url: dom.url,
       headers: dom.headerRows,
       body: dom.body,
+      repeatTotal: dom.repeatTotal,
+      repeatConcurrency: dom.repeatConcurrency,
     }[key];
     if (target) target.classList.add('invalid');
   }
@@ -279,7 +291,7 @@
   // ---------------- 发送请求与结果展示 ----------------
 
   async function sendRequest() {
-    if (state.busy) return;
+    if (state.busy || isRepeatRunning()) return;
     clearFieldErrors();
 
     const draft = collectDraft();
@@ -555,6 +567,284 @@
     return 'string';
   }
 
+  // ---------------- 重复发起区（并发闸门） ----------------
+
+  const REPEAT_TICK_MS = 250;
+
+  function isRepeatRunning() {
+    return !!(state.repeat && state.repeat.phase === 'running');
+  }
+
+  // 正整数解析：空值、0、负数、小数、科学计数法一律不成立
+  function parsePositiveInt(raw) {
+    const text = String(raw === null || raw === undefined ? '' : raw).trim();
+    if (!text) return { ok: false };
+    if (!/^\d+$/.test(text)) return { ok: false };
+    const num = Number(text);
+    if (!Number.isSafeInteger(num) || num <= 0) return { ok: false };
+    return { ok: true, value: num };
+  }
+
+  function validateRepeatInputs() {
+    const errors = [];
+    const totalParsed = parsePositiveInt(dom.repeatTotal.value);
+    const concurrencyParsed = parsePositiveInt(dom.repeatConcurrency.value);
+
+    if (!totalParsed.ok) {
+      const filled = dom.repeatTotal.value.trim();
+      errors.push({
+        field: 'repeatTotal',
+        message: filled
+          ? `本轮总次数必须是正整数，当前填写的「${filled}」不成立`
+          : '请填写本轮总次数（正整数）',
+      });
+    }
+    if (!concurrencyParsed.ok) {
+      const filled = dom.repeatConcurrency.value.trim();
+      errors.push({
+        field: 'repeatConcurrency',
+        message: filled
+          ? `同一时刻最多在飞必须是正整数，当前填写的「${filled}」不成立`
+          : '请填写同一时刻最多在飞次数（正整数）',
+      });
+    }
+    if (totalParsed.ok && concurrencyParsed.ok && concurrencyParsed.value > totalParsed.value) {
+      errors.push({
+        field: 'repeatConcurrency',
+        message: `同一时刻最多在飞（${concurrencyParsed.value}）不能大于本轮总次数（${totalParsed.value}）`,
+      });
+    }
+    return {
+      ok: errors.length === 0,
+      errors,
+      total: totalParsed.ok ? totalParsed.value : 0,
+      concurrency: concurrencyParsed.ok ? concurrencyParsed.value : 0,
+    };
+  }
+
+  // FIFO 闸门：拿不到位置的调用按先后次序进队列，release 时只放行最早排队的一个
+  function acquireSlot(round) {
+    if (round.active < round.concurrency) {
+      round.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      round.waitQueue.push(resolve);
+    });
+  }
+
+  function releaseSlot(round) {
+    round.active -= 1;
+    const next = round.waitQueue.shift();
+    if (next) {
+      round.active += 1;
+      next();
+    }
+  }
+
+  async function startRepeatRound() {
+    if (isRepeatRunning()) return;
+    clearFieldErrors();
+
+    const draft = collectDraft();
+    if (!draft.url) {
+      showFieldError('url', '请填写目标地址');
+      showNotice('请求区还没有填写目标地址，无法重复发起', 'error');
+      dom.url.focus();
+      return;
+    }
+    if (draft.body.trim() && (draft.method === 'GET' || draft.method === 'HEAD')) {
+      showFieldError('body', `请求方式为 ${draft.method} 时不带请求内容，请清空请求内容或更换请求方式`);
+      showNotice('请求方式与请求内容不匹配，请调整后再发送', 'error');
+      return;
+    }
+
+    const checked = validateRepeatInputs();
+    if (!checked.ok) {
+      checked.errors.forEach((item) => showFieldError(item.field, item.message));
+      const first = checked.errors[0];
+      const target = first.field === 'repeatTotal' ? dom.repeatTotal : dom.repeatConcurrency;
+      showNotice(`重复发起区的填写不成立：${first.message}`, 'error');
+      target.focus();
+      return;
+    }
+
+    const now = Date.now();
+    const round = {
+      phase: 'running',
+      total: checked.total,
+      concurrency: checked.concurrency,
+      draft,
+      items: [],
+      active: 0,
+      sentCount: 0,
+      doneCount: 0,
+      waitQueue: [],
+      tickTimer: 0,
+    };
+    for (let index = 0; index < checked.total; index += 1) {
+      round.items.push({
+        status: 'queued', // queued（排队中）→ flying（在飞中）→ done（已结束）
+        queuedAt: now,
+        sentAt: 0,
+        finishedAt: 0,
+        result: null,
+        error: '',
+      });
+    }
+    state.repeat = round;
+
+    setRepeatLocked(true);
+    renderRepeatAll();
+    showNotice(`这一轮共发起 ${round.total} 次，同一时刻最多 ${round.concurrency} 次在飞`, 'info');
+
+    round.tickTimer = window.setInterval(renderRepeatAll, REPEAT_TICK_MS);
+    for (let index = 0; index < round.total; index += 1) {
+      runRepeatItem(round, index);
+    }
+  }
+
+  async function runRepeatItem(round, index) {
+    await acquireSlot(round);
+
+    const item = round.items[index];
+    item.status = 'flying';
+    item.sentAt = Date.now();
+    round.sentCount += 1;
+    renderRepeatAll();
+
+    try {
+      item.result = await request('/api/send', { method: 'POST', body: round.draft });
+    } catch (err) {
+      item.error = err.message;
+    } finally {
+      item.status = 'done';
+      item.finishedAt = Date.now();
+      releaseSlot(round);
+      round.doneCount += 1;
+      renderRepeatAll();
+      if (round.doneCount === round.total) finishRepeatRound(round);
+    }
+  }
+
+  function finishRepeatRound(round) {
+    round.phase = 'finished';
+    window.clearInterval(round.tickTimer);
+    round.tickTimer = 0;
+    setRepeatLocked(false);
+    renderRepeatAll();
+    showNotice(`这一轮已全部结束：共 ${round.total} 次，在飞上限 ${round.concurrency} 次`, 'success');
+  }
+
+  // 轮次进行中锁定：重复发起区取值不可改，请求区内容同样不可改
+  function setRepeatLocked(locked) {
+    dom.repeatTotal.disabled = locked;
+    dom.repeatConcurrency.disabled = locked;
+    dom.repeatStart.disabled = locked;
+    document
+      .querySelectorAll('#request-panel input, #request-panel select, #request-panel textarea, #request-panel button')
+      .forEach((node) => {
+        node.disabled = locked;
+      });
+    if (!locked) dom.repeatStart.textContent = '再来一轮';
+  }
+
+  function renderRepeatEmpty() {
+    dom.repeatPhaseTag.textContent = '待开始';
+    dom.repeatPhaseTag.className = 'panel-tag';
+    dom.statQueued.textContent = '0';
+    dom.statFlying.textContent = '0';
+    dom.statSent.textContent = '0';
+    dom.statDone.textContent = '0';
+    dom.repeatRows.textContent = '';
+    const hint = document.createElement('p');
+    hint.className = 'repeat-empty';
+    hint.textContent = '填好本轮总次数与同一时刻最多在飞次数后点「开始这一轮」，每一次的排队与发出情况会列在这里。';
+    dom.repeatRows.appendChild(hint);
+  }
+
+  function renderRepeatAll() {
+    const round = state.repeat;
+    if (!round) {
+      renderRepeatEmpty();
+      return;
+    }
+
+    const tag = dom.repeatPhaseTag;
+    if (round.phase === 'running') {
+      tag.textContent = `进行中 · 上限 ${round.concurrency}`;
+      tag.className = 'panel-tag tag-running';
+    } else {
+      tag.textContent = '已完成';
+      tag.className = 'panel-tag tag-finished';
+    }
+
+    let queued = 0;
+    let flying = 0;
+    round.items.forEach((item) => {
+      if (item.status === 'queued') queued += 1;
+      else if (item.status === 'flying') flying += 1;
+    });
+    dom.statQueued.textContent = String(queued);
+    dom.statFlying.textContent = String(flying);
+    dom.statSent.textContent = String(round.sentCount);
+    dom.statDone.textContent = String(round.doneCount);
+
+    dom.repeatRows.textContent = '';
+    let queuePosition = 0;
+    const now = Date.now();
+    round.items.forEach((item, index) => {
+      if (item.status === 'queued') queuePosition += 1;
+      dom.repeatRows.appendChild(buildRepeatRow(item, index, now, item.status === 'queued' ? queuePosition : 0));
+    });
+  }
+
+  function buildRepeatRow(item, index, now, queuePosition) {
+    const row = document.createElement('div');
+    row.className = 'repeat-row';
+
+    const main = document.createElement('div');
+    main.className = 'repeat-row-main';
+
+    const indexNode = document.createElement('span');
+    indexNode.className = 'repeat-index';
+    indexNode.textContent = `#${String(index + 1).padStart(2, '0')}`;
+
+    const stateNode = document.createElement('span');
+    const extraNode = document.createElement('span');
+    extraNode.className = 'repeat-row-extra';
+
+    if (item.status === 'queued') {
+      // 排队中的条目只显示排队状态与已等待时长，不会显示成已发出
+      stateNode.className = 'repeat-state repeat-state-queued';
+      stateNode.textContent = '排队中';
+      extraNode.textContent = `队中第 ${queuePosition} 位 · 已等待 ${formatDuration(now - item.queuedAt)}`;
+    } else if (item.status === 'flying') {
+      stateNode.className = 'repeat-state repeat-state-flying';
+      stateNode.textContent = '在飞中';
+      extraNode.textContent = `已发出 · 已用时 ${formatDuration(now - item.sentAt)}`;
+    } else if (item.result) {
+      const result = item.result;
+      const bad = !result.ok || result.status >= 400;
+      stateNode.className = bad ? 'repeat-state repeat-state-bad' : 'repeat-state repeat-state-ok';
+      if (result.ok) {
+        stateNode.textContent = `${result.status} ${result.statusText}`.trim();
+        extraNode.textContent = `已结束 · 耗时 ${formatDuration(result.timeMs)}`;
+      } else {
+        stateNode.textContent = '未完成';
+        extraNode.textContent = `已结束 · ${result.failure.reason}`;
+      }
+    } else {
+      stateNode.className = 'repeat-state repeat-state-bad';
+      stateNode.textContent = '未发出';
+      extraNode.textContent = `已结束 · ${item.error || '请求没有发出去'}`;
+    }
+
+    main.append(indexNode, stateNode);
+    row.append(main, extraNode);
+    return row;
+  }
+
   // ---------------- 用例区 ----------------
 
   async function loadCases() {
@@ -668,7 +958,7 @@
 
   // 回填：把用例保存下来的内容写回请求区，可以直接点发送请求重发一次
   function applyCase(item) {
-    if (state.busy) return;
+    if (state.busy || isRepeatRunning()) return;
     fillDraft(item);
     state.selectedId = item.id;
     renderCases();
@@ -677,7 +967,7 @@
   }
 
   async function openDetail(id) {
-    if (state.busy) return;
+    if (state.busy || isRepeatRunning()) return;
     try {
       const item = await request(`/api/cases/${encodeURIComponent(id)}`);
       state.selectedId = item.id;
@@ -759,7 +1049,7 @@
   // ---------------- 保存与删除 ----------------
 
   async function saveCase() {
-    if (state.busy) return;
+    if (state.busy || isRepeatRunning()) return;
     clearFieldErrors();
 
     const draft = collectDraft();
@@ -944,6 +1234,18 @@
     dom.sendRequest.addEventListener('click', sendRequest);
     dom.saveCase.addEventListener('click', saveCase);
 
+    dom.repeatStart.addEventListener('click', startRepeatRound);
+    [dom.repeatTotal, dom.repeatConcurrency].forEach((input) => {
+      input.addEventListener('input', () => {
+        const slot = document.querySelector(`[data-error="${input === dom.repeatTotal ? 'repeatTotal' : 'repeatConcurrency'}"]`);
+        if (slot) {
+          slot.hidden = true;
+          slot.textContent = '';
+        }
+        input.classList.remove('invalid');
+      });
+    });
+
     dom.resetDraft.addEventListener('click', () => {
       if (state.busy) return;
       resetDraft(false);
@@ -977,6 +1279,7 @@
     renderHeaderRows();
     renderEmptyDetail();
     renderEmptyResult();
+    renderRepeatEmpty();
     renderCases();
     await checkHealth();
     await loadDemos();

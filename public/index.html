@@ -86,6 +86,53 @@
         </div>
       </section>
 
+      <section class="panel" id="repeat-panel">
+        <div class="panel-head">
+          <h2>重复发起区</h2>
+          <span class="panel-tag" id="repeat-phase-tag">待开始</span>
+        </div>
+
+        <p class="field-hint repeat-intro">按请求区当前填写的地址与内容，连续发起多次；超出在飞上限的次数按先到先得排队，空出一个位置就放行最早排队的一次。</p>
+
+        <div class="repeat-fields">
+          <div class="field">
+            <label for="repeat-total">本轮总次数</label>
+            <input id="repeat-total" type="number" min="1" step="1" value="5" autocomplete="off" />
+            <p class="field-error" data-error="repeatTotal" hidden></p>
+          </div>
+          <div class="field">
+            <label for="repeat-concurrency">同一时刻最多在飞</label>
+            <input id="repeat-concurrency" type="number" min="1" step="1" value="2" autocomplete="off" />
+            <p class="field-error" data-error="repeatConcurrency" hidden></p>
+          </div>
+        </div>
+
+        <div class="repeat-stats">
+          <div class="stat-tile stat-queued">
+            <span class="stat-num" id="stat-queued">0</span>
+            <span class="stat-label">排队中</span>
+          </div>
+          <div class="stat-tile stat-flying">
+            <span class="stat-num" id="stat-flying">0</span>
+            <span class="stat-label">在飞中</span>
+          </div>
+          <div class="stat-tile stat-sent">
+            <span class="stat-num" id="stat-sent">0</span>
+            <span class="stat-label">已发出</span>
+          </div>
+          <div class="stat-tile stat-done">
+            <span class="stat-num" id="stat-done">0</span>
+            <span class="stat-label">已结束</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="repeat-start">开始这一轮</button>
+        </div>
+
+        <div class="repeat-rows" id="repeat-rows"></div>
+      </section>
+
       <section class="panel" id="result-panel">
         <div class="panel-head">
           <h2>响应结果</h2>
