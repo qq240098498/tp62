@@ -86,6 +86,42 @@
         </div>
       </section>
 
+      <section class="panel" id="repeat-panel">
+        <div class="panel-head">
+          <h2>重复发起区</h2>
+          <span class="panel-tag" id="repeat-phase-tag">未开始</span>
+        </div>
+
+        <p class="field-hint repeat-intro">
+          按请求区当前填写的内容，对同一地址连续发起多次；超出在飞上限的次数按先到先得排队，空出一个位置就放行最早排队的一次。
+        </p>
+
+        <div class="repeat-fields">
+          <div class="field">
+            <label for="repeat-total">本轮总次数</label>
+            <input id="repeat-total" type="text" inputmode="numeric" autocomplete="off" value="1" />
+            <p class="field-error" data-error="repeatTotal" hidden></p>
+          </div>
+          <div class="field">
+            <label for="repeat-limit">同一时刻最多在飞</label>
+            <input id="repeat-limit" type="text" inputmode="numeric" autocomplete="off" value="1" />
+            <p class="field-error" data-error="repeatLimit" hidden></p>
+          </div>
+          <div class="field repeat-action-field">
+            <button type="button" class="btn btn-primary" id="repeat-start">开始本轮</button>
+          </div>
+        </div>
+
+        <div class="repeat-stats" id="repeat-stats" hidden>
+          <span class="chip chip-stat" data-stat="queued">排队 <b id="repeat-stat-queued">0</b></span>
+          <span class="chip chip-stat" data-stat="inflight">在飞 <b id="repeat-stat-inflight">0</b></span>
+          <span class="chip chip-stat" data-stat="sent">已发出 <b id="repeat-stat-sent">0</b> / <b id="repeat-stat-total">0</b></span>
+          <span class="chip chip-stat" data-stat="done">已结束 <b id="repeat-stat-done">0</b></span>
+        </div>
+
+        <div class="repeat-list" id="repeat-list"></div>
+      </section>
+
       <section class="panel" id="result-panel">
         <div class="panel-head">
           <h2>响应结果</h2>

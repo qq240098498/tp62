@@ -34,6 +34,17 @@
     refreshCases: document.getElementById('refresh-cases'),
     caseDetail: document.getElementById('case-detail'),
     closeDetail: document.getElementById('close-detail'),
+    repeatTotal: document.getElementById('repeat-total'),
+    repeatLimit: document.getElementById('repeat-limit'),
+    repeatStart: document.getElementById('repeat-start'),
+    repeatPhaseTag: document.getElementById('repeat-phase-tag'),
+    repeatStats: document.getElementById('repeat-stats'),
+    repeatStatQueued: document.getElementById('repeat-stat-queued'),
+    repeatStatInflight: document.getElementById('repeat-stat-inflight'),
+    repeatStatSent: document.getElementById('repeat-stat-sent'),
+    repeatStatTotal: document.getElementById('repeat-stat-total'),
+    repeatStatDone: document.getElementById('repeat-stat-done'),
+    repeatList: document.getElementById('repeat-list'),
   };
 
   const emptyDetailHint = '在用例列表点「详情」，这里显示该用例保存下来的目标地址、请求头与请求内容。';
@@ -104,6 +115,8 @@
 
   function clearFieldErrors() {
     document.querySelectorAll('.field-error').forEach((node) => {
+      // 重复发起区的出错标记由该区域自己的开始动作管理，这里不动
+      if (node.closest('#repeat-panel')) return;
       node.hidden = true;
       node.textContent = '';
     });
@@ -555,6 +568,287 @@
     return 'string';
   }
 
+  // ---------------- 重复发起区（同一地址连续发起 + 在飞上限排队） ----------------
+
+  // 一轮最多允许的总次数，避免一次发出过多请求把页面与目标服务压垮
+  const MAX_REPEAT_TOTAL = 1000;
+
+  // 本轮运行态：开始后 total/limit/draft 全部锁定，调度只认 entries 与 queue
+  const repeat = {
+    running: false,
+    total: 0,
+    limit: 0,
+    inflight: 0,
+    sent: 0,
+    done: 0,
+    queue: [], // 还在排队的条目，数组顺序即先到先得的放行次序
+    entries: [], // 本轮全部条目，供列表渲染与结束汇总
+    draft: null, // 本轮开始时的请求草稿快照，进行中不再随表单变化
+    timer: 0,
+  };
+
+  // 正整数校验：空值、0、小数、负数、含其他字符一律不成立
+  function parsePositiveInteger(text, label) {
+    const value = String(text == null ? '' : text).trim();
+    if (!value) return { ok: false, message: `请填写${label}` };
+    if (!/^\d+$/.test(value)) {
+      return { ok: false, message: `${label}必须是正整数，不能填写小数点、负号或其他字符` };
+    }
+    if (!/^[1-9]\d*$/.test(value)) {
+      return { ok: false, message: `${label}必须是大于 0 的正整数，不能为 0` };
+    }
+    const num = Number(value);
+    if (!Number.isSafeInteger(num)) return { ok: false, message: `${label}取值过大，请改小后再试` };
+    return { ok: true, value: num };
+  }
+
+  function showRepeatError(input, key, message) {
+    input.classList.add('invalid');
+    const slot = document.querySelector(`[data-error="${key}"]`);
+    if (slot) {
+      slot.textContent = message;
+      slot.hidden = false;
+    }
+  }
+
+  function clearRepeatErrors() {
+    ['repeatTotal', 'repeatLimit'].forEach((key) => {
+      const slot = document.querySelector(`[data-error="${key}"]`);
+      if (slot) {
+        slot.hidden = true;
+        slot.textContent = '';
+      }
+    });
+    dom.repeatTotal.classList.remove('invalid');
+    dom.repeatLimit.classList.remove('invalid');
+  }
+
+  function setRepeatLocked(locked) {
+    dom.repeatTotal.disabled = locked;
+    dom.repeatLimit.disabled = locked;
+    dom.repeatStart.disabled = locked;
+    dom.repeatStart.textContent = locked ? '本轮进行中…' : '开始本轮';
+    dom.repeatPhaseTag.textContent = locked ? '进行中' : repeat.entries.length ? '已结束' : '未开始';
+  }
+
+  async function startRepeatRound() {
+    if (repeat.running) return;
+    clearRepeatErrors();
+    clearFieldErrors();
+
+    const totalParsed = parsePositiveInteger(dom.repeatTotal.value, '本轮总次数');
+    if (!totalParsed.ok) {
+      showRepeatError(dom.repeatTotal, 'repeatTotal', totalParsed.message);
+      showNotice(totalParsed.message, 'error');
+      dom.repeatTotal.focus();
+      return;
+    }
+    const limitParsed = parsePositiveInteger(dom.repeatLimit.value, '同一时刻在飞上限');
+    if (!limitParsed.ok) {
+      showRepeatError(dom.repeatLimit, 'repeatLimit', limitParsed.message);
+      showNotice(limitParsed.message, 'error');
+      dom.repeatLimit.focus();
+      return;
+    }
+    const total = totalParsed.value;
+    const limit = limitParsed.value;
+    if (total > MAX_REPEAT_TOTAL) {
+      const message = `本轮总次数最多为 ${MAX_REPEAT_TOTAL} 次，请改小后再开始`;
+      showRepeatError(dom.repeatTotal, 'repeatTotal', message);
+      showNotice(message, 'error');
+      dom.repeatTotal.focus();
+      return;
+    }
+    if (limit > total) {
+      const message = `同一时刻在飞上限不能大于本轮总次数（当前上限 ${limit}、总次数 ${total}），请把上限改到不超过总次数`;
+      showRepeatError(dom.repeatLimit, 'repeatLimit', message);
+      showNotice(message, 'error');
+      dom.repeatLimit.focus();
+      return;
+    }
+
+    // 复用单次发送的同一套草稿口径，先在页面上把不合法的请求挡下来
+    const draft = collectDraft();
+    if (!draft.url) {
+      showFieldError('url', '请填写目标地址');
+      showNotice('请求区还没有填写目标地址，无法重复发起', 'error');
+      dom.url.focus();
+      return;
+    }
+    if (draft.body.trim() && (draft.method === 'GET' || draft.method === 'HEAD')) {
+      showFieldError('body', `请求方式为 ${draft.method} 时不带请求内容，请清空请求内容或更换请求方式`);
+      showNotice('请求方式与请求内容不匹配，请调整后再重复发起', 'error');
+      return;
+    }
+
+    const now = Date.now();
+    repeat.running = true;
+    repeat.total = total;
+    repeat.limit = limit;
+    repeat.inflight = 0;
+    repeat.sent = 0;
+    repeat.done = 0;
+    repeat.draft = draft;
+    repeat.entries = [];
+    repeat.queue = [];
+    for (let seq = 1; seq <= total; seq += 1) {
+      const entry = {
+        seq,
+        status: 'queued', // queued：排队中；sending：已发出、在飞；done：已结束
+        queuedAt: now,
+        startedAt: 0,
+        endedAt: 0,
+        result: null,
+      };
+      repeat.entries.push(entry);
+      repeat.queue.push(entry);
+    }
+
+    setRepeatLocked(true);
+    renderRepeat();
+    window.clearInterval(repeat.timer);
+    // 定时刷新排队等待与在飞耗时；条目状态变化时也会立即渲染一次
+    repeat.timer = window.setInterval(renderRepeat, 500);
+    pumpRepeat();
+    showNotice(`本轮已开始：共 ${total} 次，同一时刻最多 ${limit} 次在飞，超出部分已按先后排队`, 'info');
+  }
+
+  // 调度核心：只要在飞名额有空且队列里还有条目，就放行队首最早排队的一次
+  function pumpRepeat() {
+    while (repeat.running && repeat.inflight < repeat.limit && repeat.queue.length) {
+      launchRepeatEntry(repeat.queue.shift());
+    }
+  }
+
+  async function launchRepeatEntry(entry) {
+    repeat.inflight += 1;
+    repeat.sent += 1;
+    entry.status = 'sending';
+    entry.startedAt = Date.now();
+    renderRepeat();
+
+    try {
+      entry.result = await request('/api/send', { method: 'POST', body: repeat.draft });
+    } catch (err) {
+      // 连服务端都没调到（如网络断开），按未完成落到该条目上，不影响其余条目
+      entry.result = {
+        ok: false,
+        timeMs: Date.now() - entry.startedAt,
+        failure: { reason: err.message, detail: '' },
+      };
+    }
+
+    entry.status = 'done';
+    entry.endedAt = Date.now();
+    repeat.inflight -= 1;
+    repeat.done += 1;
+    renderRepeat();
+
+    // 空出一个位置，立刻放行队列里最早进去的那一次
+    pumpRepeat();
+    if (repeat.done === repeat.total) finishRepeatRound();
+  }
+
+  function finishRepeatRound() {
+    repeat.running = false;
+    window.clearInterval(repeat.timer);
+    repeat.timer = 0;
+    setRepeatLocked(false);
+    renderRepeat();
+
+    let responded = 0;
+    let badStatus = 0;
+    let failed = 0;
+    repeat.entries.forEach((entry) => {
+      if (entry.result && entry.result.ok) {
+        responded += 1;
+        if (entry.result.status >= 400) badStatus += 1;
+      } else {
+        failed += 1;
+      }
+    });
+    const parts = [`本轮 ${repeat.total} 次已全部结束`, `${responded} 次收到响应`];
+    if (badStatus) parts.push(`其中 ${badStatus} 次为 400 及以上状态码`);
+    if (failed) parts.push(`${failed} 次未完成`);
+    showNotice(parts.join('，'), failed ? 'error' : 'success');
+  }
+
+  function formatTick(ms) {
+    const value = Number(ms) || 0;
+    if (value < 1000) return `${value} 毫秒`;
+    return `${(value / 1000).toFixed(1)} 秒`;
+  }
+
+  function renderRepeatStats() {
+    if (!repeat.entries.length) {
+      dom.repeatStats.hidden = true;
+      return;
+    }
+    dom.repeatStats.hidden = false;
+    dom.repeatStatQueued.textContent = String(repeat.queue.length);
+    dom.repeatStatInflight.textContent = String(repeat.inflight);
+    dom.repeatStatSent.textContent = String(repeat.sent);
+    dom.repeatStatTotal.textContent = String(repeat.total);
+    dom.repeatStatDone.textContent = String(repeat.done);
+  }
+
+  function renderRepeat() {
+    renderRepeatStats();
+    dom.repeatList.textContent = '';
+
+    if (!repeat.entries.length) {
+      const hint = document.createElement('p');
+      hint.className = 'rows-empty repeat-empty';
+      hint.textContent = '填好本轮总次数与在飞上限后点「开始本轮」，这里按先后顺序列出每一次的排队、在飞与结束情况。';
+      dom.repeatList.appendChild(hint);
+      return;
+    }
+
+    const now = Date.now();
+    repeat.entries.forEach((entry) => {
+      const row = document.createElement('div');
+      row.className = 'repeat-row';
+
+      const seq = document.createElement('span');
+      seq.className = 'repeat-seq';
+      seq.textContent = `#${entry.seq}`;
+
+      const state = document.createElement('span');
+      state.className = 'repeat-state';
+
+      const detail = document.createElement('span');
+      detail.className = 'repeat-detail';
+
+      if (entry.status === 'queued') {
+        row.classList.add('repeat-queued');
+        state.textContent = '排队中';
+        const position = repeat.queue.indexOf(entry) + 1;
+        detail.textContent = `队列第 ${position} 位 · 已等待 ${formatTick(now - entry.queuedAt)}`;
+      } else if (entry.status === 'sending') {
+        row.classList.add('repeat-sending');
+        state.textContent = '在飞';
+        detail.textContent = `已发出 · 在飞 ${formatTick(now - entry.startedAt)}`;
+      } else {
+        row.classList.add('repeat-done');
+        const result = entry.result;
+        if (result && result.ok) {
+          state.classList.add(result.status >= 400 ? 'repeat-state-bad' : 'repeat-state-ok');
+          state.textContent = `已结束 ${result.status}`;
+          if (result.status >= 400) row.classList.add('repeat-bad');
+        } else {
+          state.classList.add('repeat-state-bad');
+          state.textContent = '已结束 未完成';
+          row.classList.add('repeat-bad');
+        }
+        const reason = result && result.failure ? ` · ${result.failure.reason}` : '';
+        detail.textContent = `耗时 ${formatDuration(result ? result.timeMs : 0)}${reason}`;
+      }
+
+      row.append(seq, state, detail);
+      dom.repeatList.appendChild(row);
+    });
+  }
+
   // ---------------- 用例区 ----------------
 
   async function loadCases() {
@@ -943,6 +1237,7 @@
 
     dom.sendRequest.addEventListener('click', sendRequest);
     dom.saveCase.addEventListener('click', saveCase);
+    dom.repeatStart.addEventListener('click', startRepeatRound);
 
     dom.resetDraft.addEventListener('click', () => {
       if (state.busy) return;
@@ -977,6 +1272,7 @@
     renderHeaderRows();
     renderEmptyDetail();
     renderEmptyResult();
+    renderRepeat();
     renderCases();
     await checkHealth();
     await loadDemos();
